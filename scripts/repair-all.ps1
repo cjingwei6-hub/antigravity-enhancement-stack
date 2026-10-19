@@ -18,10 +18,15 @@ param(
 
 $ErrorActionPreference = "Continue"
 
+# 屏蔽 Invoke-WebRequest / Expand-Archive 的进度条 —— 它们会刷出几万字符的噪音
+$ProgressPreference = "SilentlyContinue"
+
 # ============ 配置 ============
 $AG      = "$env:LOCALAPPDATA\Programs\antigravity"
 $AGEXE   = Join-Path $AG "Antigravity.exe"
-$RES     = Join-Path $AG "resources"
+# ⚠️ 不要用 $RES 作变量名：PowerShell 变量大小写不敏感，
+#    下面 $res = & node ... 会把 $RES 覆盖成数组，导致 Join-Path 收不到路径。
+$RSRC    = Join-Path $AG "resources"
 $CACHE   = "$env:LOCALAPPDATA\BetterGravity\PatcherCache"
 $CN_DIR  = "$env:USERPROFILE\antigravity-desktop-cn"
 $LOG_DIR = "$env:LOCALAPPDATA\AntigravityEnhance"
@@ -54,9 +59,9 @@ function Find-Node {
 }
 
 function Get-AsarState {
-    $a = Join-Path $RES "app.asar"
-    $b = Join-Path $RES "_app.asar"
-    $k = Join-Path $RES "app.asar.bak"
+    $a = Join-Path $RSRC "app.asar"
+    $b = Join-Path $RSRC "_app.asar"
+    $k = Join-Path $RSRC "app.asar.bak"
     return [pscustomobject]@{
         AppAsar   = if (Test-Path $a) { (Get-Item $a).Length } else { 0 }
         OrigAsar  = if (Test-Path $b) { (Get-Item $b).Length } else { 0 }
@@ -66,6 +71,24 @@ function Get-AsarState {
         # app.asar 是真 asar（没被 bootstrap 顶替）
         RealAsar      = ((Test-Path $a) -and (Get-Item $a).Length -gt 1000000)
     }
+}
+
+# CN 引擎在重包时写入一对分隔符，可当作"已注入"的可靠标记。
+# 已注入还去重跑，会把翻译代码再套一层（双重注入），并让 .bak 变成已汉化版本。
+$CN_MARKER = "__ANTIGRAVITY_CHINESE_LOCALIZATION_START__"
+
+function Test-CnPatched {
+    # BG 已装时生效的是 _app.asar；否则是 app.asar。bootstrap 只有 2KB，跳过。
+    foreach ($p in @((Join-Path $RSRC "_app.asar"), (Join-Path $RSRC "app.asar"))) {
+        if (-not (Test-Path $p)) { continue }
+        if ((Get-Item $p).Length -lt 1000000) { continue }
+        try {
+            # latin1：byte 与 char 一一对应，避免任何编码解码问题
+            $txt = [System.IO.File]::ReadAllText($p, [System.Text.Encoding]::GetEncoding(28591))
+            if ($txt.Contains($CN_MARKER)) { return $true }
+        } catch { }
+    }
+    return $false
 }
 
 # ============ 主流程 ============
@@ -116,33 +139,45 @@ try {
     # ---- 步骤 1：CN 汉化 ----
     Say "`n[1/2] 中文汉化（antigravity-desktop-cn）" "Cyan"
 
-    # 关键：Antigravity 更新会在 resources 里留下【上一版本】的 app.asar.bak。
-    # CN 引擎把 .bak 当"官方原版"并永远从它重打 —— 留着旧的会打错版本。
-    if ($s.BakAsar -gt 0) {
-        Log "发现残留的 app.asar.bak（$($s.BakAsar)B，多为上一版本），删除以免 CN 打错版本"
-        Remove-Item (Join-Path $RES "app.asar.bak") -Force -ErrorAction SilentlyContinue
-    }
-
-    if (-not (Test-Path (Join-Path $CN_DIR "localization_engine.js"))) {
-        Log "本地没有 CN 仓库，尝试克隆到 $CN_DIR"
-        $git = Get-Command git.exe -ErrorAction SilentlyContinue
-        if ($git) {
-            & $git.Source clone --depth 1 https://github.com/Silas-02/antigravity-desktop-cn.git $CN_DIR 2>&1 | Out-Null
+    if (Test-CnPatched) {
+        Log "CN 注入标记已存在，跳过（避免二次注入）"
+    } else {
+        # Antigravity 更新会在 resources 留下【上一版本】的 app.asar.bak。
+        # CN 把 .bak 当"官方原版"并永远从它重打 —— 留着旧的会打错版本。
+        # 只在确认 CN 未注入时才删：此时 app.asar 就是当前官方原版。
+        if ($s.BakAsar -gt 0) {
+            Log "CN 未注入，但存在残留 app.asar.bak（$($s.BakAsar)B），删除以免 CN 打错版本"
+            Remove-Item (Join-Path $RSRC "app.asar.bak") -Force -ErrorAction SilentlyContinue
         }
-    }
 
-    $engine = Join-Path $CN_DIR "localization_engine.js"
-    if (Test-Path $engine) {
+        if (-not (Test-Path (Join-Path $CN_DIR "localization_engine.js"))) {
+            Log "本地没有 CN 仓库，尝试克隆到 $CN_DIR"
+            $git = Get-Command git.exe -ErrorAction SilentlyContinue
+            if ($git) {
+                & $git.Source clone --depth 1 https://github.com/Silas-02/antigravity-desktop-cn.git $CN_DIR 2>&1 | Out-Null
+            }
+        }
+
+        $engine = Join-Path $CN_DIR "localization_engine.js"
+        if (Test-Path $engine) {
         Log "执行 CN 注入"
         Push-Location $CN_DIR
+        # CN 引擎输出是 UTF-8；PowerShell 5.1 默认按 GBK 解子进程 stdout，会写成乱码进日志
+        $prevEnc = [Console]::OutputEncoding
         try {
-            $out = & $node $engine --brand-title english 2>&1
-            $out | Out-File $LOG -Append -Encoding utf8
-            if ($LASTEXITCODE -ne 0) { Log "CN 注入失败（exit=$LASTEXITCODE），继续尝试 BG" }
-            else { Log "CN 注入成功" }
-        } finally { Pop-Location }
-    } else {
-        Log "CN 引擎不可用（未克隆成功），跳过汉化层"
+            [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+            $cnOut = & $node $engine --brand-title english 2>&1
+            $cnCode = $LASTEXITCODE
+        } finally {
+            [Console]::OutputEncoding = $prevEnc
+            Pop-Location
+        }
+        $cnOut | Out-File $LOG -Append -Encoding utf8
+        if ($cnCode -ne 0) { Log "CN 注入失败（exit=$cnCode），继续尝试 BG" }
+        else { Log "CN 注入成功" }
+        } else {
+            Log "CN 引擎不可用（未克隆成功），跳过汉化层"
+        }
     }
 
     # ---- 步骤 2：BetterGravity ----
@@ -183,11 +218,11 @@ try {
     if (-not $refreshed) { Log "注意：用的是本地缓存 runtime，可能不是最新" }
 
     $agWin = $AG -replace "\\", "/"
-    $res = & $node $cli run install $agWin ("$CACHE\runtime" -replace "\\", "/") 2>&1
-    $res | Out-File $LOG -Append -Encoding utf8
+    $patchOut = & $node $cli run install $agWin ("$CACHE\runtime" -replace "\\", "/") 2>&1
+    $patchOut | Out-File $LOG -Append -Encoding utf8
 
     $ok = $false
-    foreach ($l in $res) {
+    foreach ($l in $patchOut) {
         try {
             $o = $l.Trim() | ConvertFrom-Json
             if ($o.type -eq "result" -and $o.success) { $ok = $true; Log "BG 补丁成功" }

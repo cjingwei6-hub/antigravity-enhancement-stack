@@ -326,6 +326,50 @@ cd <dashboard 源码目录> && "$PY" manage.py status
 
 ---
 
+## 8.5 实测记录（2026-10-19，Antigravity 2.24.0）
+
+在真机上完整跑通了 **CN → BG** 两层，并验证了卸装顺序。
+
+**关键尺寸指纹**（可用来判断当前处于哪一层）：
+
+| 状态 | `app.asar` | `_app.asar` | `app.asar.bak` |
+|---|---|---|---|
+| 官方纯净 | 4,486,221 | 无 | 无 |
+| 仅 CN | **5,111,370**（+625KB ≈ 注入的翻译引擎） | 无 | 4,486,221 |
+| CN + BG | **2,222** | **5,111,370** | 4,486,221 |
+
+**CN 已注入的可靠标记**：重包后的 asar 里含 `__ANTIGRAVITY_CHINESE_LOCALIZATION_START__`（引擎写入的 START/END 分隔符，各出现 1 次）。用 raw 字节搜索即可，不需要解 asar：
+
+```powershell
+$txt = [System.IO.File]::ReadAllText($asarPath, [System.Text.Encoding]::GetEncoding(28591))  # latin1
+$patched = $txt.Contains("__ANTIGRAVITY_CHINESE_LOCALIZATION_START__")
+```
+
+**卸装顺序也验证了**：`run uninstall` 卸掉 BG 后，`app.asar` 回到 **5,111,370（CN 汉化版）** 而不是 4,486,221（官方）—— 证明 BG 的 `_app.asar` 里确实压着 CN 层，顺序设计成立。
+
+### 实测踩到的两个脚本 bug（已修）
+
+**① `$res` 覆盖 `$RES` —— PowerShell 变量大小写不敏感**
+
+```powershell
+$RES = Join-Path $AG "resources"      # 配置
+...
+$res = & $node $cli run install ...   # ← 把 $RES 覆盖成了数组！
+Get-AsarState                          # 内部 Join-Path $RES "app.asar" → 报"参数 Path 为空"
+```
+
+表现很迷惑：补丁明明成功了（日志有 `patchState: patched`），脚本却在收尾时抛异常、退出码 1。
+**对策**：资源目录命名成 `$RSRC`，别用 `$RES`；或补丁输出叫 `$patchOut`。
+
+**② 已汉化还去重跑 CN —— 双重注入**
+
+CN 的 `sourceAsar = exists(bakPath) ? bakPath : asarPath`，意味着**它总是从 `.bak` 重打**。
+如果 `app.asar` 已经是汉化版、而 `.bak` 被删了，CN 会把**已汉化的包**当官方原版备份，再注入一层 → 双重注入 + 丢掉纯净原版。
+
+**对策**：跑 CN 之前先检测注入标记；已存在就整步跳过。**删 `.bak` 只能在确认 CN 未注入时做。**
+
+---
+
 ## 9. 写 .ps1 脚本时的 BOM 坑
 
 Agent 的 PowerShell 工具是 **5.1**（`OutputEncoding=gb2312`、`ACP=936`），读**无 BOM 的 UTF-8 `.ps1`** 会按 GBK 解，中文直接炸成语法错误，而且**报错信息本身也是乱码**（`寮傚父` = `异常`）。
