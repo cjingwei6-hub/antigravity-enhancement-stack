@@ -116,19 +116,7 @@ powershell -ExecutionPolicy Bypass -File scripts\install-persistence.ps1 -Remove
 - ✅ **脚本幂等**：已装好状态下再跑，识别出「CN 标记已存在」直接跳过，7.8 秒退出码 0
 - ✅ **Dashboard**：`state: mounted`，跨版本更新一直存活
 
-### 还没验证的
 
-- ❓ **完整的「更新 → 全掉 → 自动修回」闭环**：脚本的修复路径已验证（手动制造了"仅 CN"状态再跑通），但**没有等到一次真实的 Antigravity 版本更新**来触发「两个都掉」的起点。
-- ❓ **界面观感**：脚本能确认文件层面正确、注入标记存在，但 **agent 启动不了 Antigravity**（沙箱限制），所以「中文是不是真的显示出来了」必须由人眼确认。
-- ❓ **macOS / Linux 分支**：脚本是按 Windows 写并只在 Windows 上测过。
-
-### 设计上的风险点
-
-- **`app.asar.bak` 的语义会撞车**：Antigravity 更新时也会生成 `.bak`（内容是上一版本）。CN 把它当"官方原版"并永远从它重打，所以脚本会在 CN 未注入时**删掉残留 `.bak`**，让 CN 重新备份当前版本 —— 这一步只在 `app.asar` 确实是有效原生包（>1 MB）时才做，否则可能把 bootstrap 当原版备份。
-- **CN 引擎没有 `--no-launch` 参数**。它只在"安装前客户端是开着的"时才自动重启（`if (success && wasAppRunning && !noKill)`），所以脚本坚持在 Antigravity 关闭时修复，以保持静默。
-- **三个上游都在活跃更新**，注入点随时可能变。本脚本只保证"按当前已知的正确顺序重放"，不保证永久可用。
-
----
 
 ## 目录
 
